@@ -1,0 +1,2087 @@
+# 數據分析與通知系統 - 完整規格書
+
+## 1. 系統概述
+
+### 1.1 系統目標
+開發一個類似 Metabase 的數據分析平台，整合通知功能，提供視覺化數據篩選、目標追蹤、以及自動化通知系統。
+
+### 1.2 核心功能
+- 視覺化數據查詢與分析
+- 節點式資料篩選流程設計
+- 通知系統（Email/SMS）與開啟率追蹤
+- 目標設定與達成率監控
+- CMS 通知管理
+- 儀表板與報表生成
+
+### 1.3 技術架構
+- **前端**: Vue 3 + Tailwind CSS + Vue Flow
+- **後端**: PHP 8.2+ + Laravel/Symfony
+- **數據庫**: MySQL 8.0+
+- **API 文檔**: Swagger/OpenAPI 3.0
+- **通知服務**: Email + SMS 整合
+
+## 2. 系統架構設計
+
+### 2.1 整體架構圖
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   前端 (Vue3)   │◄──►│  API Gateway    │◄──►│   後端 (PHP)    │
+│  + Vue Flow     │    │   + Swagger     │    │   + Laravel     │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+                                                        │
+                       ┌─────────────────┐             │
+                       │   通知服務      │◄────────────┤
+                       │ Email/SMS API   │             │
+                       └─────────────────┘             │
+                                                        │
+                       ┌─────────────────┐             │
+                       │   MySQL 數據庫  │◄────────────┘
+                       │   + 追蹤數據    │
+                       └─────────────────┘
+```
+
+### 2.2 模組化設計 (SOLID 原則)
+
+#### 單一職責原則 (SRP)
+- **DataFilterService**: 專責數據篩選邏輯
+- **NotificationService**: 專責通知發送
+- **TrackingService**: 專責開啟率追蹤
+- **ReportService**: 專責報表生成
+- **GoalService**: 專責目標管理
+
+#### 開放封閉原則 (OCP)
+- 使用 Strategy Pattern 實現不同篩選節點類型
+- 使用 Factory Pattern 創建不同通知渠道
+
+#### 里氏替換原則 (LSP)
+- 抽象 NotificationChannel 介面
+- 具體實現 EmailChannel, SmsChannel
+
+#### 介面隔離原則 (ISP)
+- 分離讀寫介面 (CQRS 模式)
+- 細分權限介面
+
+#### 依賴反轉原則 (DIP)
+- 使用依賴注入容器
+- 基於介面編程
+
+## 3. 功能需求規格
+
+### 3.1 數據篩選系統
+
+#### 3.1.1 節點類型定義
+```typescript
+interface FilterNode {
+  id: string;
+  type: 'source' | 'filter' | 'aggregation' | 'output';
+  config: NodeConfig;
+  position: { x: number, y: number };
+}
+
+interface NodeConfig {
+  // 數據源節點
+  source?: {
+    table: string;
+    columns: string[];
+    availableFilters?: ColumnFilterConfig[]; // 可用篩選條件
+  };
+
+  // 篩選節點
+  filter?: {
+    column: string;
+    operator: 'equals' | 'contains' | 'greater_than' | 'less_than' | 'between' | 'in';
+    value: any;
+  };
+
+  // 聚合節點
+  aggregation?: {
+    type: 'count' | 'sum' | 'avg' | 'max' | 'min';
+    column?: string;
+    groupBy?: string[];
+  };
+}
+
+// 欄位篩選配置
+interface ColumnFilterConfig {
+  column: string;
+  displayName: string;
+  dataType: 'string' | 'number' | 'date' | 'boolean' | 'enum';
+  isVisible: boolean; // 是否在篩選器中顯示
+  isFilterable: boolean; // 是否可篩選
+  defaultOperator?: string;
+  allowedOperators: string[];
+  enumValues?: string[]; // 枚舉值（用於下拉選擇）
+  placeholder?: string;
+  validation?: {
+    required?: boolean;
+    min?: number;
+    max?: number;
+    pattern?: string;
+  };
+}
+
+// 表格篩選預設配置
+interface TableFilterPreset {
+  tableName: string;
+  displayName: string;
+  description?: string;
+  columns: ColumnFilterConfig[];
+  hiddenColumns: string[]; // 預設隱藏的欄位
+  commonFilters: string[]; // 常用篩選欄位
+  autoHideRules: AutoHideRule[]; // 自動隱藏規則
+}
+
+// 自動隱藏規則
+interface AutoHideRule {
+  condition: 'column_count_over' | 'data_type' | 'column_name_pattern' | 'low_cardinality';
+  value: any;
+  hideColumns?: string[];
+  showColumns?: string[];
+}
+```
+
+#### 3.1.2 智能篩選條件管理
+
+##### 自動欄位分析與預設
+系統會自動分析數據表結構，並根據以下規則決定欄位的篩選器顯示狀態：
+
+**預設顯示的欄位類型**:
+1. **常用業務欄位**: `id`, `name`, `email`, `status`, `type`, `category`
+2. **時間欄位**: `created_at`, `updated_at`, `date`, `time`
+3. **數值欄位**: 金額、數量、評分等
+4. **枚舉欄位**: 狀態、類型等有限選項欄位
+
+**預設隱藏的欄位類型**:
+1. **系統欄位**: `deleted_at`, `remember_token`, `email_verified_at`
+2. **大文本欄位**: `description`, `content`, `notes` 等 TEXT 類型
+3. **二進制欄位**: `password_hash`, `api_key`, `token`
+4. **高基數欄位**: 唯一值過多的欄位（如 UUID、詳細地址）
+5. **技術欄位**: `created_by`, `updated_by`, `version`
+
+**智能隱藏規則**:
+```typescript
+const autoHideRules: AutoHideRule[] = [
+  {
+    condition: 'column_count_over',
+    value: 20, // 超過20個欄位時啟用智能隱藏
+    hideColumns: ['created_by', 'updated_by', 'deleted_at', 'remember_token']
+  },
+  {
+    condition: 'data_type',
+    value: 'text',
+    hideColumns: ['description', 'content', 'notes', 'remarks']
+  },
+  {
+    condition: 'column_name_pattern',
+    value: /_(hash|token|key|secret)$/i,
+    hideColumns: true // 隱藏匹配的欄位
+  },
+  {
+    condition: 'low_cardinality',
+    value: 0.1, // 唯一值比例低於10%的欄位優先顯示
+    showColumns: true
+  }
+];
+```
+
+##### 欄位篩選器配置界面
+```typescript
+// 篩選器管理組件
+interface FilterManagerConfig {
+  tableName: string;
+  availableColumns: ColumnInfo[];
+  currentFilters: ColumnFilterConfig[];
+  presets: FilterPreset[];
+}
+
+// 欄位信息
+interface ColumnInfo {
+  name: string;
+  displayName: string;
+  dataType: string;
+  nullable: boolean;
+  defaultValue: any;
+  maxLength?: number;
+  uniqueValues?: number; // 唯一值數量
+  sampleValues?: any[]; // 樣本數據
+  isIndexed: boolean; // 是否有索引（影響查詢性能）
+}
+
+// 預設篩選器方案
+interface FilterPreset {
+  id: string;
+  name: string;
+  description: string;
+  isDefault: boolean;
+  filters: string[]; // 顯示的欄位列表
+  commonCombinations: FilterCombination[]; // 常用組合
+}
+
+interface FilterCombination {
+  name: string;
+  filters: {
+    column: string;
+    operator: string;
+    value?: any;
+  }[];
+}
+```
+1. **數據源節點**: 連接數據表
+2. **篩選節點**: 條件篩選 (=, !=, >, <, LIKE, IN, BETWEEN)
+3. **聚合節點**: 統計函數 (COUNT, SUM, AVG, MAX, MIN)
+4. **排序節點**: 數據排序
+5. **限制節點**: LIMIT/OFFSET
+6. **輸出節點**: 結果輸出
+
+### 3.2 通知系統
+
+#### 3.2.1 通知類型
+- **Email 通知**: HTML/純文字格式
+- **SMS 通知**: 簡訊發送
+- **系統內通知**: 站內訊息
+
+#### 3.2.2 追蹤功能
+```sql
+-- 通知追蹤表
+CREATE TABLE notification_tracking (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    notification_id BIGINT NOT NULL,
+    recipient VARCHAR(255) NOT NULL,
+    type ENUM('email', 'sms', 'system') NOT NULL,
+    status ENUM('sent', 'delivered', 'opened', 'clicked', 'failed') NOT NULL,
+    tracking_token VARCHAR(64) UNIQUE,
+    opened_at TIMESTAMP NULL,
+    clicked_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
+#### 3.2.3 開啟率追蹤實現
+- **Email**: 嵌入 1x1 像素圖片
+- **SMS**: 短網址點擊追蹤
+- **系統內**: 閱讀狀態記錄
+
+### 3.3 目標管理系統
+
+#### 3.3.1 目標類型
+```typescript
+interface Goal {
+  id: string;
+  name: string;
+  description: string;
+  type: 'numeric' | 'percentage' | 'boolean';
+  target_value: number;
+  current_value: number;
+  period: 'daily' | 'weekly' | 'monthly' | 'quarterly' | 'yearly';
+  data_source_config: FilterFlowConfig;
+  status: 'active' | 'paused' | 'completed';
+}
+```
+
+#### 3.3.2 達成率計算
+- 實時計算當前值
+- 歷史趨勢分析
+- 預測分析 (可選)
+
+### 3.4 CMS 通知管理
+
+#### 3.4.1 功能特性
+- 通知模板管理
+- 收件人群組管理
+- 排程發送
+- 批量操作
+- 發送歷史查詢
+
+## 4. 數據庫設計
+
+### 4.1 核心表結構
+
+```sql
+-- 篩選流程表
+CREATE TABLE filter_flows (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    config JSON NOT NULL, -- Vue Flow 配置
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    INDEX idx_created_by (created_by)
+);
+
+-- 通知配置表
+CREATE TABLE notifications (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(255) NOT NULL,
+    type ENUM('email', 'sms', 'system') NOT NULL,
+    template_id BIGINT,
+    recipients JSON NOT NULL, -- 收件人列表
+    filter_flow_id BIGINT, -- 關聯篩選流程
+    schedule_config JSON, -- 排程配置
+    status ENUM('active', 'paused', 'draft') DEFAULT 'draft',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (filter_flow_id) REFERENCES filter_flows(id),
+    INDEX idx_status (status),
+    INDEX idx_type (type)
+);
+
+-- 目標表
+CREATE TABLE goals (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    type ENUM('numeric', 'percentage', 'boolean') NOT NULL,
+    target_value DECIMAL(15,4) NOT NULL,
+    current_value DECIMAL(15,4) DEFAULT 0,
+    period ENUM('daily', 'weekly', 'monthly', 'quarterly', 'yearly') NOT NULL,
+    filter_flow_id BIGINT NOT NULL,
+    status ENUM('active', 'paused', 'completed') DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (filter_flow_id) REFERENCES filter_flows(id),
+    INDEX idx_status (status),
+    INDEX idx_period (period)
+);
+
+-- 用戶表
+CREATE TABLE users (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    username VARCHAR(100) UNIQUE NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role ENUM('admin', 'analyst', 'viewer') DEFAULT 'viewer',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    INDEX idx_email (email),
+    INDEX idx_role (role)
+);
+
+-- 資料表篩選器配置
+CREATE TABLE table_filter_configs (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    table_name VARCHAR(255) NOT NULL,
+    display_name VARCHAR(255) NOT NULL,
+    description TEXT,
+    config JSON NOT NULL, -- 欄位配置和規則
+    is_active BOOLEAN DEFAULT TRUE,
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    UNIQUE KEY unique_table_name (table_name),
+    FOREIGN KEY (created_by) REFERENCES users(id),
+    INDEX idx_table_name (table_name),
+    INDEX idx_is_active (is_active)
+);
+
+-- 欄位篩選器設定
+CREATE TABLE column_filter_settings (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    table_name VARCHAR(255) NOT NULL,
+    column_name VARCHAR(255) NOT NULL,
+    display_name VARCHAR(255) NOT NULL,
+    data_type ENUM('string', 'number', 'date', 'boolean', 'enum', 'text') NOT NULL,
+    is_visible BOOLEAN DEFAULT TRUE,
+    is_filterable BOOLEAN DEFAULT TRUE,
+    sort_order INT DEFAULT 0,
+    default_operator VARCHAR(50),
+    allowed_operators JSON,
+    enum_values JSON, -- 枚舉值列表
+    validation_rules JSON, -- 驗證規則
+    placeholder_text VARCHAR(255),
+    help_text TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    UNIQUE KEY unique_table_column (table_name, column_name),
+    INDEX idx_table_name (table_name),
+    INDEX idx_is_visible (is_visible),
+    INDEX idx_sort_order (sort_order)
+);
+
+-- 篩選器預設方案
+CREATE TABLE filter_presets (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    table_name VARCHAR(255) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    is_default BOOLEAN DEFAULT FALSE,
+    config JSON NOT NULL, -- 預設篩選器配置
+    usage_count INT DEFAULT 0, -- 使用次數統計
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (created_by) REFERENCES users(id),
+    INDEX idx_table_name (table_name),
+    INDEX idx_is_default (is_default),
+    INDEX idx_usage_count (usage_count)
+);
+
+-- 常用篩選組合
+CREATE TABLE common_filter_combinations (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    table_name VARCHAR(255) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    filters JSON NOT NULL, -- 篩選條件組合
+    usage_count INT DEFAULT 0,
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (created_by) REFERENCES users(id),
+    INDEX idx_table_name (table_name),
+    INDEX idx_usage_count (usage_count)
+);
+
+-- 資料表元數據快取
+CREATE TABLE table_metadata_cache (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    table_name VARCHAR(255) NOT NULL,
+    schema_info JSON NOT NULL, -- 表結構信息
+    statistics JSON, -- 統計信息（行數、唯一值等）
+    last_analyzed TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    UNIQUE KEY unique_table_name (table_name),
+    INDEX idx_last_analyzed (last_analyzed)
+);
+
+-- 儀表板表
+CREATE TABLE dashboards (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    config JSON NOT NULL, -- 儀表板配置
+    is_public BOOLEAN DEFAULT FALSE,
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (created_by) REFERENCES users(id),
+    INDEX idx_created_by (created_by),
+    INDEX idx_is_public (is_public)
+);
+```
+
+## 5. API 設計規範
+
+### 5.1 RESTful API 端點
+
+#### 5.1.1 篩選流程 API
+```yaml
+/api/v1/filter-flows:
+  get:
+    summary: 獲取篩選流程列表
+    parameters:
+      - name: page
+        in: query
+        type: integer
+      - name: per_page
+        in: query
+        type: integer
+      - name: search
+        in: query
+        type: string
+  post:
+    summary: 創建篩選流程
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FilterFlowCreate'
+
+/api/v1/filter-flows/{id}:
+  get:
+    summary: 獲取特定篩選流程
+  put:
+    summary: 更新篩選流程
+  delete:
+    summary: 删除篩選流程
+
+/api/v1/filter-flows/{id}/execute:
+  post:
+    summary: 執行篩選流程
+    responses:
+      200:
+        description: 執行結果
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutionResult'
+
+# 資料表篩選器管理 API
+/api/v1/tables:
+  get:
+    summary: 獲取可用資料表列表
+    responses:
+      200:
+        description: 資料表列表
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/TableInfo'
+
+/api/v1/tables/{tableName}/columns:
+  get:
+    summary: 獲取資料表欄位信息
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: analyze
+        in: query
+        schema:
+          type: boolean
+        description: 是否重新分析欄位統計
+    responses:
+      200:
+        description: 欄位信息列表
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ColumnInfo'
+
+/api/v1/tables/{tableName}/filter-config:
+  get:
+    summary: 獲取資料表篩選器配置
+  put:
+    summary: 更新資料表篩選器配置
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/TableFilterConfig'
+
+/api/v1/tables/{tableName}/presets:
+  get:
+    summary: 獲取資料表篩選器預設方案
+  post:
+    summary: 創建篩選器預設方案
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FilterPreset'
+
+/api/v1/tables/{tableName}/sample-data:
+  get:
+    summary: 獲取資料表樣本數據
+    parameters:
+      - name: columns
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+        description: 指定欄位列表
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          default: 100
+    responses:
+      200:
+        description: 樣本數據
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: array
+                  items:
+                    type: object
+                total:
+                  type: integer
+                columns:
+                  type: array
+                  items:
+                    type: string
+
+/api/v1/filter-combinations:
+  get:
+    summary: 獲取常用篩選組合
+    parameters:
+      - name: table_name
+        in: query
+        schema:
+          type: string
+  post:
+    summary: 保存篩選組合
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FilterCombination'
+```
+
+#### 5.1.2 通知 API
+```yaml
+/api/v1/notifications:
+  get:
+    summary: 獲取通知列表
+  post:
+    summary: 創建通知
+
+/api/v1/notifications/{id}/send:
+  post:
+    summary: 發送通知
+
+/api/v1/notifications/tracking/{token}:
+  get:
+    summary: 追蹤通知開啟 (用於郵件/SMS 點擊)
+```
+
+### 5.2 Swagger 配置
+
+#### 5.2.1 基本配置
+```yaml
+openapi: 3.0.0
+info:
+  title: 數據分析與通知系統 API
+  description: 提供數據篩選、通知發送、目標追蹤等功能的 API
+  version: 1.0.0
+servers:
+  - url: http://localhost:8000/api/v1
+    description: 開發環境
+  - url: https://api.example.com/v1
+    description: 生產環境
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    TableFilterConfig:
+      type: object
+      required:
+        - tableName
+        - displayName
+        - columns
+      properties:
+        tableName:
+          type: string
+        displayName:
+          type: string
+        description:
+          type: string
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/ColumnFilterConfig'
+        autoHideRules:
+          type: array
+          items:
+            $ref: '#/components/schemas/AutoHideRule'
+
+    ColumnFilterConfig:
+      type: object
+      required:
+        - column
+        - displayName
+        - dataType
+      properties:
+        column:
+          type: string
+        displayName:
+          type: string
+        dataType:
+          type: string
+          enum: [string, number, date, boolean, enum, text]
+        isVisible:
+          type: boolean
+          default: true
+        isFilterable:
+          type: boolean
+          default: true
+        sortOrder:
+          type: integer
+          default: 0
+        defaultOperator:
+          type: string
+        allowedOperators:
+          type: array
+          items:
+            type: string
+        enumValues:
+          type: array
+          items:
+            type: string
+        placeholder:
+          type: string
+        helpText:
+          type: string
+        validation:
+          type: object
+          properties:
+            required:
+              type: boolean
+            min:
+              type: number
+            max:
+              type: number
+            pattern:
+              type: string
+
+    TableInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        displayName:
+          type: string
+        description:
+          type: string
+        rowCount:
+          type: integer
+        columnCount:
+          type: integer
+        lastAnalyzed:
+          type: string
+          format: date-time
+        hasFilterConfig:
+          type: boolean
+
+    ColumnInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        displayName:
+          type: string
+        dataType:
+          type: string
+        nullable:
+          type: boolean
+        defaultValue:
+          type: string
+        maxLength:
+          type: integer
+          nullable: true
+        uniqueValues:
+          type: integer
+        sampleValues:
+          type: array
+          items: {}
+        isIndexed:
+          type: boolean
+        cardinality:
+          type: number
+          description: 唯一值比例
+
+    FilterPreset:
+      type: object
+      required:
+        - name
+        - filters
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        isDefault:
+          type: boolean
+        filters:
+          type: array
+          items:
+            type: string
+        commonCombinations:
+          type: array
+          items:
+            $ref: '#/components/schemas/FilterCombination'
+
+    FilterCombination:
+      type: object
+      required:
+        - name
+        - filters
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        filters:
+          type: array
+          items:
+            type: object
+            properties:
+              column:
+                type: string
+              operator:
+                type: string
+              value: {}
+
+    AutoHideRule:
+      type: object
+      required:
+        - condition
+        - value
+      properties:
+        condition:
+          type: string
+          enum: [column_count_over, data_type, column_name_pattern, low_cardinality]
+        value: {}
+        hideColumns:
+          type: array
+          items:
+            type: string
+        showColumns:
+          type: array
+          items:
+            type: string
+```
+
+## 6. 安全性考量
+
+### 6.1 認證與授權
+
+#### 6.1.1 JWT 認證
+```php
+// JWT 配置
+class JWTConfig {
+    public const ALGORITHM = 'HS256';
+    public const ACCESS_TOKEN_TTL = 3600; // 1小時
+    public const REFRESH_TOKEN_TTL = 604800; // 7天
+}
+
+// 權限中間件
+class AuthMiddleware {
+    public function handle($request, $next, $role = null) {
+        $token = $this->extractToken($request);
+        $user = $this->validateToken($token);
+
+        if ($role && !$this->hasRole($user, $role)) {
+            throw new UnauthorizedException();
+        }
+
+        return $next($request);
+    }
+}
+```
+
+#### 6.1.2 角色權限系統
+```sql
+-- 權限表
+CREATE TABLE permissions (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100) UNIQUE NOT NULL,
+    description TEXT,
+    resource VARCHAR(100) NOT NULL,
+    action VARCHAR(50) NOT NULL
+);
+
+-- 角色權限關聯表
+CREATE TABLE role_permissions (
+    role ENUM('admin', 'analyst', 'viewer') NOT NULL,
+    permission_id BIGINT NOT NULL,
+    PRIMARY KEY (role, permission_id),
+    FOREIGN KEY (permission_id) REFERENCES permissions(id)
+);
+
+-- 基本權限數據
+INSERT INTO permissions (name, description, resource, action) VALUES
+('filter_flows.create', '創建篩選流程', 'filter_flows', 'create'),
+('filter_flows.read', '查看篩選流程', 'filter_flows', 'read'),
+('filter_flows.update', '修改篩選流程', 'filter_flows', 'update'),
+('filter_flows.delete', '删除篩選流程', 'filter_flows', 'delete'),
+('notifications.send', '發送通知', 'notifications', 'send'),
+('goals.manage', '管理目標', 'goals', 'manage');
+```
+
+### 6.2 數據安全
+
+#### 6.2.1 SQL 注入防護
+```php
+class SecureQueryBuilder {
+    private PDO $connection;
+
+    public function buildFilterQuery(array $filters): string {
+        $conditions = [];
+        $params = [];
+
+        foreach ($filters as $filter) {
+            $this->validateFilter($filter);
+            $conditions[] = $this->buildCondition($filter, $params);
+        }
+
+        return "SELECT * FROM table WHERE " . implode(' AND ', $conditions);
+    }
+
+    private function validateFilter(array $filter): void {
+        $allowedOperators = ['=', '!=', '>', '<', 'LIKE', 'IN', 'BETWEEN'];
+        if (!in_array($filter['operator'], $allowedOperators)) {
+            throw new InvalidArgumentException('Invalid operator');
+        }
+
+        // 驗證欄位名稱
+        if (!$this->isValidColumn($filter['column'])) {
+            throw new InvalidArgumentException('Invalid column');
+        }
+    }
+}
+```
+
+#### 6.2.2 輸入驗證
+```php
+class FilterFlowValidator {
+    public function validate(array $data): array {
+        $rules = [
+            'name' => 'required|string|max:255',
+            'description' => 'nullable|string|max:1000',
+            'config' => 'required|array',
+            'config.nodes' => 'required|array',
+            'config.edges' => 'required|array'
+        ];
+
+        return $this->validateData($data, $rules);
+    }
+
+    public function validateNodeConfig(array $node): void {
+        $allowedTypes = ['source', 'filter', 'aggregation', 'output'];
+        if (!in_array($node['type'], $allowedTypes)) {
+            throw new ValidationException('Invalid node type');
+        }
+
+        // 根據節點類型驗證配置
+        switch ($node['type']) {
+            case 'source':
+                $this->validateSourceNode($node);
+                break;
+            case 'filter':
+                $this->validateFilterNode($node);
+                break;
+            // ... 其他節點類型
+        }
+    }
+}
+```
+
+### 6.3 通知安全
+
+#### 6.3.1 追蹤 Token 安全
+```php
+class TrackingTokenService {
+    public function generateToken(int $notificationId, string $recipient): string {
+        $payload = [
+            'notification_id' => $notificationId,
+            'recipient' => hash('sha256', $recipient),
+            'expires_at' => time() + (30 * 24 * 3600) // 30天過期
+        ];
+
+        return $this->encrypt(json_encode($payload));
+    }
+
+    public function validateToken(string $token): ?array {
+        try {
+            $payload = json_decode($this->decrypt($token), true);
+
+            if ($payload['expires_at'] < time()) {
+                return null;
+            }
+
+            return $payload;
+        } catch (Exception $e) {
+            return null;
+        }
+    }
+}
+```
+
+### 6.4 API 安全
+
+#### 6.4.1 速率限制
+```php
+class RateLimitMiddleware {
+    public function handle($request, $next, $maxAttempts = 60, $decayMinutes = 1) {
+        $key = $this->resolveRequestSignature($request);
+
+        if ($this->limiter->tooManyAttempts($key, $maxAttempts)) {
+            throw new TooManyRequestsException();
+        }
+
+        $this->limiter->hit($key, $decayMinutes * 60);
+
+        return $next($request);
+    }
+}
+```
+
+#### 6.4.2 CORS 配置
+```php
+class CorsMiddleware {
+    public function handle($request, $next) {
+        $response = $next($request);
+
+        $response->headers->set('Access-Control-Allow-Origin', $this->getAllowedOrigins());
+        $response->headers->set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+        $response->headers->set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        $response->headers->set('Access-Control-Max-Age', '86400');
+
+        return $response;
+    }
+}
+```
+
+## 7. 前端架構設計
+
+### 7.1 Vue 3 + Composition API 結構
+
+#### 7.1.1 項目結構
+```
+src/
+├── components/           # 共用組件
+│   ├── ui/              # UI 基礎組件
+│   ├── charts/          # 圖表組件
+│   └── flow/            # Vue Flow 相關組件
+├── views/               # 頁面組件
+│   ├── Dashboard/       # 儀表板
+│   ├── FilterFlow/      # 篩選流程
+│   ├── Notifications/   # 通知管理
+│   └── Goals/           # 目標管理
+├── composables/         # Composition API 邏輯
+├── stores/              # Pinia 狀態管理
+├── services/            # API 服務
+├── utils/               # 工具函數
+└── types/               # TypeScript 類型定義
+```
+
+#### 7.1.2 Vue Flow 整合
+```typescript
+// composables/useFilterFlow.ts
+import { ref, computed } from 'vue';
+import { useVueFlow } from '@vue-flow/core';
+import type { Node, Edge } from '@vue-flow/core';
+
+export function useFilterFlow() {
+  const { nodes, edges, addNodes, addEdges, removeNodes, removeEdges } = useVueFlow();
+
+  const nodeTypes = ref({
+    source: 'SourceNode',
+    filter: 'FilterNode',
+    aggregation: 'AggregationNode',
+    output: 'OutputNode'
+  });
+
+  const addFilterNode = (type: string, position: { x: number, y: number }) => {
+    const newNode: Node = {
+      id: `${type}-${Date.now()}`,
+      type,
+      position,
+      data: {
+        label: `${type} Node`,
+        config: getDefaultConfig(type)
+      }
+    };
+
+    addNodes([newNode]);
+  };
+
+  const executeFlow = async () => {
+    const flowConfig = {
+      nodes: nodes.value,
+      edges: edges.value
+    };
+
+    return await filterFlowService.execute(flowConfig);
+  };
+
+  return {
+    nodes,
+    edges,
+    nodeTypes,
+    addFilterNode,
+    executeFlow
+  };
+}
+```
+
+### 7.2 狀態管理 (Pinia)
+
+```typescript
+// stores/filterFlow.ts
+import { defineStore } from 'pinia';
+import { ref, computed } from 'vue';
+import type { FilterFlow, ExecutionResult } from '@/types';
+
+export const useFilterFlowStore = defineStore('filterFlow', () => {
+  const flows = ref<FilterFlow[]>([]);
+  const currentFlow = ref<FilterFlow | null>(null);
+  const executionResults = ref<ExecutionResult[]>([]);
+  const isLoading = ref(false);
+
+  const getFlowById = computed(() => {
+    return (id: string) => flows.value.find(flow => flow.id === id);
+  });
+
+  const fetchFlows = async () => {
+    isLoading.value = true;
+    try {
+      flows.value = await filterFlowService.getAll();
+    } finally {
+      isLoading.value = false;
+    }
+  };
+
+  const createFlow = async (flowData: Partial<FilterFlow>) => {
+    const newFlow = await filterFlowService.create(flowData);
+    flows.value.push(newFlow);
+    return newFlow;
+  };
+
+  const updateFlow = async (id: string, flowData: Partial<FilterFlow>) => {
+    const updatedFlow = await filterFlowService.update(id, flowData);
+    const index = flows.value.findIndex(flow => flow.id === id);
+    if (index !== -1) {
+      flows.value[index] = updatedFlow;
+    }
+    return updatedFlow;
+  };
+
+  return {
+    flows,
+    currentFlow,
+    executionResults,
+    isLoading,
+    getFlowById,
+    fetchFlows,
+    createFlow,
+    updateFlow
+  };
+});
+```
+
+## 8. 後端架構設計
+
+### 8.1 Domain-Driven Design (DDD) 結構
+
+```
+app/
+├── Domain/              # 領域層
+│   ├── FilterFlow/
+│   │   ├── Entity/      # 實體
+│   │   ├── Repository/  # 倉庫介面
+│   │   ├── Service/     # 領域服務
+│   │   └── ValueObject/ # 值對象
+│   ├── Notification/
+│   └── Goal/
+├── Infrastructure/      # 基礎設施層
+│   ├── Database/        # 數據庫實現
+│   ├── Http/           # HTTP 相關
+│   ├── Notification/   # 通知服務實現
+│   └── Cache/          # 快取實現
+├── Application/         # 應用層
+│   ├── Services/       # 應用服務
+│   ├── Commands/       # 命令
+│   ├── Queries/        # 查詢
+│   └── Handlers/       # 處理器
+└── Interfaces/          # 介面層
+    ├── Http/           # HTTP 控制器
+    ├── Console/        # 命令行
+    └── Jobs/           # 後台任務
+```
+
+### 8.2 核心服務實現
+
+#### 8.2.1 篩選流程服務
+```php
+namespace App\Domain\FilterFlow\Service;
+
+class FilterFlowExecutionService {
+    public function __construct(
+        private QueryBuilderFactory $queryBuilderFactory,
+        private DatabaseConnection $connection,
+        private CacheService $cache
+    ) {}
+
+    public function execute(FilterFlowConfig $config): ExecutionResult {
+        $cacheKey = $this->generateCacheKey($config);
+
+        if ($cachedResult = $this->cache->get($cacheKey)) {
+            return $cachedResult;
+        }
+
+        $queryBuilder = $this->queryBuilderFactory->create();
+        $query = $this->buildQuery($config, $queryBuilder);
+
+        $result = $this->connection->query($query);
+        $executionResult = new ExecutionResult($result);
+
+        $this->cache->put($cacheKey, $executionResult, 300); // 5分鐘快取
+
+        return $executionResult;
+    }
+
+    private function buildQuery(FilterFlowConfig $config, QueryBuilder $builder): string {
+        $sourceNode = $config->getSourceNode();
+        $builder->from($sourceNode->getTable());
+
+        foreach ($config->getFilterNodes() as $filterNode) {
+            $this->applyFilter($builder, $filterNode);
+        }
+
+        foreach ($config->getAggregationNodes() as $aggNode) {
+            $this->applyAggregation($builder, $aggNode);
+        }
+
+        return $builder->toSql();
+    }
+}
+```
+
+#### 8.2.2 通知服務
+```php
+namespace App\Domain\Notification\Service;
+
+class NotificationService {
+    public function __construct(
+        private NotificationChannelFactory $channelFactory,
+        private TrackingService $trackingService,
+        private TemplateEngine $templateEngine
+    ) {}
+
+    public function send(NotificationRequest $request): NotificationResult {
+        $channel = $this->channelFactory->create($request->getType());
+        $template = $this->templateEngine->render($request->getTemplate(), $request->getData());
+
+        $trackingToken = $this->trackingService->createToken(
+            $request->getId(),
+            $request->getRecipient()
+        );
+
+        // 在內容中嵌入追蹤碼
+        $content = $this->injectTrackingCode($template, $trackingToken);
+
+        $result = $channel->send($request->getRecipient(), $content);
+
+        $this->trackingService->recordSent($request->getId(), $result);
+
+        return $result;
+    }
+
+    private function injectTrackingCode(string $content, string $token): string {
+        if (strpos($content, '<html>') !== false) {
+            // HTML 郵件，添加追蹤像素
+            $trackingPixel = sprintf(
+                '<img src="%s/api/v1/tracking/%s/open" width="1" height="1" style="display:none;">',
+                config('app.url'),
+                $token
+            );
+
+            return str_replace('</body>', $trackingPixel . '</body>', $content);
+        }
+
+        return $content;
+    }
+}
+```
+
+## 9. 測試策略
+
+### 9.1 測試金字塔
+
+#### 9.1.1 單元測試 (70%)
+```php
+// tests/Unit/Domain/FilterFlow/Service/FilterFlowExecutionServiceTest.php
+class FilterFlowExecutionServiceTest extends TestCase {
+    private FilterFlowExecutionService $service;
+    private MockObject $queryBuilderFactory;
+    private MockObject $connection;
+    private MockObject $cache;
+
+    protected function setUp(): void {
+        $this->queryBuilderFactory = $this->createMock(QueryBuilderFactory::class);
+        $this->connection = $this->createMock(DatabaseConnection::class);
+        $this->cache = $this->createMock(CacheService::class);
+
+        $this->service = new FilterFlowExecutionService(
+            $this->queryBuilderFactory,
+            $this->connection,
+            $this->cache
+        );
+    }
+
+    public function testExecuteWithCachedResult(): void {
+        $config = new FilterFlowConfig([/* ... */]);
+        $expectedResult = new ExecutionResult([/* ... */]);
+
+        $this->cache
+            ->expects($this->once())
+            ->method('get')
+            ->willReturn($expectedResult);
+
+        $result = $this->service->execute($config);
+
+        $this->assertEquals($expectedResult, $result);
+    }
+}
+```
+
+#### 9.1.2 整合測試 (20%)
+```php
+// tests/Integration/Api/FilterFlowControllerTest.php
+class FilterFlowControllerTest extends TestCase {
+    use RefreshDatabase;
+
+    public function testCreateFilterFlow(): void {
+        $user = User::factory()->create(['role' => 'analyst']);
+
+        $response = $this->actingAs($user)
+            ->postJson('/api/v1/filter-flows', [
+                'name' => 'Test Flow',
+                'description' => 'Test Description',
+                'config' => [
+                    'nodes' => [/* ... */],
+                    'edges' => [/* ... */]
+                ]
+            ]);
+
+        $response->assertStatus(201)
+            ->assertJsonStructure([
+                'data' => [
+                    'id',
+                    'name',
+                    'description',
+                    'config',
+                    'created_at'
+                ]
+            ]);
+
+        $this->assertDatabaseHas('filter_flows', [
+            'name' => 'Test Flow',
+            'description' => 'Test Description',
+            'created_by' => $user->id
+        ]);
+    }
+
+    public function testExecuteFilterFlow(): void {
+        $user = User::factory()->create(['role' => 'analyst']);
+        $filterFlow = FilterFlow::factory()->create(['created_by' => $user->id]);
+
+        $response = $this->actingAs($user)
+            ->postJson("/api/v1/filter-flows/{$filterFlow->id}/execute");
+
+        $response->assertStatus(200)
+            ->assertJsonStructure([
+                'data' => [
+                    'columns',
+                    'rows',
+                    'total_count',
+                    'execution_time'
+                ]
+            ]);
+    }
+}
+```
+
+#### 9.1.3 端到端測試 (10%)
+```typescript
+// tests/e2e/filter-flow.spec.ts
+import { test, expect } from '@playwright/test';
+
+test.describe('Filter Flow Management', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/login');
+    await page.fill('[data-testid="email"]', 'analyst@example.com');
+    await page.fill('[data-testid="password"]', 'password');
+    await page.click('[data-testid="login-button"]');
+    await page.waitForURL('/dashboard');
+  });
+
+  test('should create a new filter flow', async ({ page }) => {
+    await page.goto('/filter-flows');
+    await page.click('[data-testid="create-flow-button"]');
+
+    // 填寫基本資訊
+    await page.fill('[data-testid="flow-name"]', 'E2E Test Flow');
+    await page.fill('[data-testid="flow-description"]', 'Created by E2E test');
+
+    // 添加數據源節點
+    await page.click('[data-testid="add-source-node"]');
+    await page.selectOption('[data-testid="source-table"]', 'users');
+
+    // 添加篩選節點
+    await page.click('[data-testid="add-filter-node"]');
+    await page.selectOption('[data-testid="filter-column"]', 'created_at');
+    await page.selectOption('[data-testid="filter-operator"]', 'greater_than');
+    await page.fill('[data-testid="filter-value"]', '2024-01-01');
+
+    // 連接節點
+    await page.dragAndDrop(
+      '[data-testid="source-node-output"]',
+      '[data-testid="filter-node-input"]'
+    );
+
+    // 保存流程
+    await page.click('[data-testid="save-flow-button"]');
+
+    // 驗證創建成功
+    await expect(page.locator('[data-testid="success-message"]')).toBeVisible();
+    await expect(page.locator('text=E2E Test Flow')).toBeVisible();
+  });
+
+  test('should execute filter flow and display results', async ({ page }) => {
+    await page.goto('/filter-flows/1');
+    await page.click('[data-testid="execute-flow-button"]');
+
+    // 等待執行完成
+    await page.waitForSelector('[data-testid="execution-results"]');
+
+    // 驗證結果顯示
+    await expect(page.locator('[data-testid="results-table"]')).toBeVisible();
+    await expect(page.locator('[data-testid="row-count"]')).toContainText(/\d+ rows/);
+  });
+});
+```
+
+### 9.2 測試資料管理
+
+#### 9.2.1 Factory 類別
+```php
+// database/factories/FilterFlowFactory.php
+class FilterFlowFactory extends Factory {
+    protected $model = FilterFlow::class;
+
+    public function definition(): array {
+        return [
+            'name' => $this->faker->sentence(3),
+            'description' => $this->faker->paragraph(),
+            'config' => [
+                'nodes' => [
+                    [
+                        'id' => 'source-1',
+                        'type' => 'source',
+                        'position' => ['x' => 100, 'y' => 100],
+                        'data' => [
+                            'table' => 'users',
+                            'columns' => ['id', 'name', 'email', 'created_at']
+                        ]
+                    ],
+                    [
+                        'id' => 'output-1',
+                        'type' => 'output',
+                        'position' => ['x' => 400, 'y' => 100],
+                        'data' => []
+                    ]
+                ],
+                'edges' => [
+                    [
+                        'id' => 'edge-1',
+                        'source' => 'source-1',
+                        'target' => 'output-1'
+                    ]
+                ]
+            ],
+            'created_by' => User::factory(),
+            'created_at' => now(),
+            'updated_at' => now()
+        ];
+    }
+
+    public function withFilters(): static {
+        return $this->state(function (array $attributes) {
+            $config = $attributes['config'];
+            $config['nodes'][] = [
+                'id' => 'filter-1',
+                'type' => 'filter',
+                'position' => ['x' => 250, 'y' => 100],
+                'data' => [
+                    'column' => 'created_at',
+                    'operator' => 'greater_than',
+                    'value' => '2024-01-01'
+                ]
+            ];
+
+            return ['config' => $config];
+        });
+    }
+}
+```
+
+## 10. 部署與運維
+
+### 10.1 Docker 容器化
+
+#### 10.1.1 Docker Compose 配置
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.php
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=mysql
+      - DB_DATABASE=analytics_system
+      - DB_USERNAME=root
+      - DB_PASSWORD=secret
+      - REDIS_HOST=redis
+    volumes:
+      - ./backend:/var/www/html
+    depends_on:
+      - mysql
+      - redis
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+    environment:
+      - VITE_API_URL=http://localhost:8000/api/v1
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      - MYSQL_ROOT_PASSWORD=secret
+      - MYSQL_DATABASE=analytics_system
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - app
+      - frontend
+
+volumes:
+  mysql_data:
+  redis_data:
+```
+
+#### 10.1.2 PHP Dockerfile
+```dockerfile
+# Dockerfile.php
+FROM php:8.2-fpm
+
+# 安裝系統依賴
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    libpng-dev \
+    libonig-dev \
+    libxml2-dev \
+    zip \
+    unzip
+
+# 安裝 PHP 擴展
+RUN docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd
+
+# 安裝 Composer
+COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+
+# 設置工作目錄
+WORKDIR /var/www/html
+
+# 複製應用程式文件
+COPY backend/ .
+
+# 安裝 PHP 依賴
+RUN composer install --no-dev --optimize-autoloader
+
+# 設置權限
+RUN chown -R www-data:www-data /var/www/html \
+    && chmod -R 755 /var/www/html/storage
+
+EXPOSE 8000
+
+CMD ["php", "artisan", "serve", "--host=0.0.0.0", "--port=8000"]
+```
+
+#### 10.1.3 Node.js Dockerfile
+```dockerfile
+# Dockerfile.node
+FROM node:18-alpine
+
+WORKDIR /app
+
+# 複製 package 文件
+COPY frontend/package*.json ./
+
+# 安裝依賴
+RUN npm ci --only=production
+
+# 複製源代碼
+COPY frontend/ .
+
+# 構建應用
+RUN npm run build
+
+EXPOSE 3000
+
+CMD ["npm", "run", "preview", "--", "--host", "0.0.0.0"]
+```
+
+### 10.2 CI/CD 流程
+
+#### 10.2.1 GitHub Actions 配置
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: secret
+          MYSQL_DATABASE: test_db
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.2'
+        extensions: mbstring, xml, ctype, iconv, intl, pdo_mysql
+        coverage: xdebug
+
+    - name: Install PHP dependencies
+      run: composer install --prefer-dist --no-progress
+      working-directory: ./backend
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install Node dependencies
+      run: npm ci
+      working-directory: ./frontend
+
+    - name: Run PHP tests
+      run: |
+        cp .env.testing .env
+        php artisan key:generate
+        php artisan migrate
+        php artisan test --coverage-clover coverage.xml
+      working-directory: ./backend
+      env:
+        DB_HOST: 127.0.0.1
+        DB_PORT: 3306
+        DB_DATABASE: test_db
+        DB_USERNAME: root
+        DB_PASSWORD: secret
+
+    - name: Run Frontend tests
+      run: npm run test:unit
+      working-directory: ./frontend
+
+    - name: Run E2E tests
+      run: |
+        npm run build
+        npm run test:e2e
+      working-directory: ./frontend
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Deploy to production
+      uses: appleboy/ssh-action@v0.1.5
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USERNAME }}
+        key: ${{ secrets.PRIVATE_KEY }}
+        script: |
+          cd /var/www/analytics-system
+          git pull origin main
+          docker-compose down
+          docker-compose up -d --build
+          docker-compose exec -T app php artisan migrate --force
+          docker-compose exec -T app php artisan config:cache
+          docker-compose exec -T app php artisan route:cache
+```
+
+### 10.3 監控與日誌
+
+#### 10.3.1 應用監控
+```php
+// app/Services/MonitoringService.php
+class MonitoringService {
+    public function logExecutionMetrics(string $flowId, float $executionTime, int $resultCount): void {
+        Log::info('Filter flow executed', [
+            'flow_id' => $flowId,
+            'execution_time' => $executionTime,
+            'result_count' => $resultCount,
+            'memory_usage' => memory_get_peak_usage(true),
+            'timestamp' => now()->toISOString()
+        ]);
+
+        // 發送指標到監控系統
+        if ($executionTime > 30) { // 超過30秒的查詢
+            $this->alertSlowQuery($flowId, $executionTime);
+        }
+    }
+
+    public function logNotificationMetrics(string $notificationId, string $channel, bool $success): void {
+        Log::info('Notification sent', [
+            'notification_id' => $notificationId,
+            'channel' => $channel,
+            'success' => $success,
+            'timestamp' => now()->toISOString()
+        ]);
+    }
+
+    private function alertSlowQuery(string $flowId, float $executionTime): void {
+        // 發送 Slack 警報或其他通知
+    }
+}
+```
+
+#### 10.3.2 系統健康檢查
+```php
+// routes/api.php
+Route::get('/health', function () {
+    $health = [
+        'status' => 'ok',
+        'timestamp' => now()->toISOString(),
+        'services' => []
+    ];
+
+    // 檢查數據庫連接
+    try {
+        DB::connection()->getPdo();
+        $health['services']['database'] = 'ok';
+    } catch (Exception $e) {
+        $health['services']['database'] = 'error';
+        $health['status'] = 'error';
+    }
+
+    // 檢查 Redis 連接
+    try {
+        Redis::ping();
+        $health['services']['redis'] = 'ok';
+    } catch (Exception $e) {
+        $health['services']['redis'] = 'error';
+        $health['status'] = 'error';
+    }
+
+    // 檢查磁碟空間
+    $diskSpace = disk_free_space('/');
+    $health['services']['disk_space'] = $diskSpace > 1000000000 ? 'ok' : 'warning'; // 1GB
+
+    return response()->json($health, $health['status'] === 'ok' ? 200 : 503);
+});
+```
+
+## 11. 專案計劃與里程碑
+
+### 11.1 開發階段規劃
+
+#### 第一階段：基礎架構 (4週)
+**目標**: 建立基本的系統架構和核心功能
+
+**任務列表**:
+1. **週 1-2: 後端基礎架構**
+   - [ ] 設置 Laravel 專案結構
+   - [ ] 實現 JWT 認證系統
+   - [ ] 建立基礎數據庫結構
+   - [ ] 實現用戶管理功能
+   - [ ] 設置 Swagger API 文檔
+   - [ ] 建立基礎中間件 (CORS, 認證, 速率限制)
+
+2. **週 2-3: 前端基礎架構**
+   - [ ] 設置 Vue 3 + Vite 專案
+   - [ ] 配置 Tailwind CSS 和基礎樣式
+   - [ ] 實現路由系統和導航
+   - [ ] 建立登入/登出功能
+   - [ ] 設置 Pinia 狀態管理
+   - [ ] 建立基礎 UI 組件庫
+
+3. **週 3-4: 開發環境和部署**
+   - [ ] 配置 Docker 容器化
+   - [ ] 設置開發環境數據庫
+   - [ ] 建立 CI/CD 流程
+   - [ ] 實現基礎測試框架
+   - [ ] 配置代碼品質檢查工具
+
+**驗收標準**:
+- 用戶可以註冊、登入、登出
+- API 文檔可正常訪問
+- 基礎 UI 界面正常顯示
+- Docker 環境可正常運行
+
+#### 第二階段：數據篩選系統 (6週)
+**目標**: 實現核心的視覺化數據篩選功能
+
+**任務列表**:
+1. **週 5-6: 數據源管理**
+   - [ ] 實現數據庫連接管理
+   - [ ] 建立數據表結構探索 API
+   - [ ] 實現數據預覽功能
+   - [ ] 建立數據源配置界面
+   - [ ] 實現數據類型自動識別
+
+2. **週 7-8: Vue Flow 整合**
+   - [ ] 整合 Vue Flow 組件
+   - [ ] 實現各種節點類型組件
+   - [ ] 建立節點配置面板
+   - [ ] 實現節點拖拉功能
+   - [ ] 建立連接線邏輯驗證
+
+3. **週 9-10: 查詢執行引擎**
+   - [ ] 實現 SQL 查詢構建器
+   - [ ] 建立查詢優化機制
+   - [ ] 實現結果快取系統
+   - [ ] 建立查詢執行監控
+   - [ ] 實現查詢結果分頁
+
+**驗收標準**:
+- 用戶可以通過拖拉節點建立篩選流程
+- 系統可以正確執行篩選查詢
+- 查詢結果可以正常顯示
+- 複雜查詢性能符合要求 (<30秒)
+
+#### 第三階段：通知系統 (4週)
+**目標**: 實現通知發送和追蹤功能
+
+**任務列表**:
+1. **週 11-12: 通知核心功能**
+   - [ ] 實現郵件發送服務
+   - [ ] 實現簡訊發送服務
+   - [ ] 建立通知模板系統
+   - [ ] 實現收件人群組管理
+   - [ ] 建立通知排程功能
+
+2. **週 13-14: 追蹤系統**
+   - [ ] 實現郵件開啟追蹤
+   - [ ] 實現簡訊點擊追蹤
+   - [ ] 建立追蹤數據統計
+   - [ ] 實現開啟率報表
+   - [ ] 建立通知歷史查詢
+
+**驗收標準**:
+- 系統可以發送郵件和簡訊通知
+- 可以準確追蹤開啟率和點擊率
+- 通知模板系統正常運作
+- 排程發送功能穩定
+
+#### 第四階段：目標管理與報表 (4週)
+**目標**: 實現目標設定和達成率監控
+
+**任務列表**:
+1. **週 15-16: 目標管理**
+   - [ ] 實現目標設定功能
+   - [ ] 建立目標類型管理
+   - [ ] 實現目標與篩選流程關聯
+   - [ ] 建立目標達成率計算
+   - [ ] 實現目標進度追蹤
+
+2. **週 17-18: 儀表板與報表**
+   - [ ] 建立儀表板設計器
+   - [ ] 實現各種圖表類型
+   - [ ] 建立報表生成功能
+   - [ ] 實現數據匯出功能
+   - [ ] 建立報表排程功能
+
+**驗收標準**:
+- 用戶可以設定和管理目標
+- 目標達成率計算準確
+- 儀表板可以正常顯示各種圖表
+- 報表可以正常生成和匯出
+
+#### 第五階段：優化與上線 (3週)
+**目標**: 系統優化、安全加固和正式上線
+
+**任務列表**:
+1. **週 19: 性能優化**
+   - [ ] 數據庫查詢優化
+   - [ ] 前端性能優化
+   - [ ] 快取策略優化
+   - [ ] API 響應時間優化
+
+2. **週 20: 安全測試**
+   - [ ] 安全漏洞掃描
+   - [ ] 滲透測試
+   - [ ] 權限控制測試
+   - [ ] 數據安全驗證
+
+3. **週 21: 上線準備**
+   - [ ] 生產環境部署
+   - [ ] 數據遷移測試
+   - [ ] 用戶培訓文檔
+   - [ ] 系統監控設置
+
+### 11.2 人力資源規劃
+
+#### 開發團隊組成
+- **專案經理** × 1: 負責專案管理和進度控制
+- **後端開發** × 2: PHP/Laravel 開發
+- **前端開發** × 2: Vue.js 開發
+- **UI/UX 設計** × 1: 界面設計和用戶體驗
+- **測試工程師** × 1: 功能測試和自動化測試
+- **DevOps 工程師** × 1: 部署和運維
+
+#### 技能要求
+**後端開發人員**:
+- 精通 PHP 8.2+ 和 Laravel/Symfony
+- 熟悉 MySQL 數據庫設計和優化
+- 了解 Redis 快取和排隊系統
+- 具備 RESTful API 設計經驗
+- 熟悉 Docker 和微服務架構
+
+**前端開發人員**:
+- 精通 Vue 3 和 Composition API
+- 熟悉 TypeScript 和現代 JavaScript
+- 具備 Tailwind CSS 和響應式設計經驗
+- 了解 Vue Flow 或類似流程圖庫
+- 熟悉前端測試框架
+
+### 11.3 風險評估與應對
+
+#### 技術風險
+1. **Vue Flow 整合複雜度**
+   - **風險**: Vue Flow 學習曲線陡峭，可能影響開發進度
+   - **應對**: 提前進行技術預研，準備備選方案 (如 D3.js)
+
+2. **大數據量查詢性能**
+   - **風險**: 複雜查詢可能導致性能問題
+   - **應對**: 實現查詢優化、分頁、快取等機制
+
+3. **通知追蹤準確性**
+   - **風險**: 郵件追蹤可能被阻擋，影響統計準確性
+   - **應對**: 提供多種追蹤方式，並明確告知用戶限制
+
+#### 進度風險
+1. **功能範圍過大**
+   - **風險**: 21週內可能無法完成所有功能
+   - **應對**: 按優先級分階段交付，核心功能優先
+
+2. **第三方服務依賴**
+   - **風險**: 郵件/簡訊服務商問題可能影響開發
+   - **應對**: 選擇可靠的服務商，準備備選方案
+
+#### 安全風險
+1. **SQL 注入攻擊**
+   - **風險**: 動態查詢構建可能存在安全漏洞
+   - **應對**: 使用參數化查詢，實現嚴格的輸入驗證
+
+2. **敏感數據洩露**
+   - **風險**: 通知內容可能包含敏感信息
+   - **應對**: 實現數據加密，建立存取日誌審計
+
+### 11.4 品質保證計劃
+
+#### 代碼品質
+- **代碼審查**: 所有代碼必須經過同事審查
+- **靜態分析**: 使用 PHPStan、ESLint 等工具
+- **代碼覆蓋率**: 單元測試覆蓋率要求 >80%
+- **編碼規範**: 遵循 PSR-12 (PHP) 和 Vue 官方風格指南
+
+#### 測試策略
+- **單元測試**: 70% 測試覆蓋，重點測試業務邏輯
+- **整合測試**: 20% 測試覆蓋，測試 API 端點
+- **端到端測試**: 10% 測試覆蓋，測試關鍵用戶流程
+- **性能測試**: 關鍵 API 響應時間 <2秒
+- **安全測試**: 每週進行自動化安全掃描
+
+#### 交付標準
+每個階段交付必須滿足：
+- [ ] 所有功能測試通過
+- [ ] 代碼審查完成
+- [ ] 文檔更新完整
+- [ ] 部署腳本測試通過
+- [ ] 性能指標符合要求
+
+## 12. 成本估算
+
+### 12.1 開發成本
+- **人力成本**: 8人 × 21週 × 週薪 = 約 168 人週
+- **基礎設施成本**: 雲端服務、開發工具授權等
+- **第三方服務**: 郵件服務、簡訊服務等月費
+
+### 12.2 維護成本
+- **服務器成本**: 月租費用
+- **第三方服務費**: 按使用量計費
+- **人力維護**: 1-2名開發人員進行日常維護
+
+### 12.3 ROI 預期
+- **提升數據分析效率**: 減少手動查詢時間 80%
+- **自動化通知**: 減少人工發送成本 90%
+- **決策速度提升**: 實時數據監控，加快決策 50%
+
+## 13. 後續擴展計劃
+
+### 13.1 第二版本功能
+- **機器學習預測**: 基於歷史數據進行趨勢預測
+- **更多數據源**: 支援 PostgreSQL、MongoDB 等
+- **移動端應用**: 開發 iOS/Android 應用
+- **多租戶支援**: SaaS 化部署
+
+### 13.2 企業級功能
+- **單點登入 (SSO)**: 整合企業現有認證系統
+- **細粒度權限**: 行級和列級數據權限控制
+- **審計日誌**: 完整的操作追蹤和合規報告
+- **高可用部署**: 多節點叢集和災難恢復
+
+---
+
+*本規格書版本: v1.0*
+*最後更新: 2025年8月5日*
+*審核狀態: 待審核*
